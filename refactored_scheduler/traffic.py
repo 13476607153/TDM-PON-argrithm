@@ -1,6 +1,6 @@
 """流量生成与同周期合并。
 
-包含 BE 泊松到达流量生成，以及 TS 周期流按 ONU 和周期进行合并的逻辑。
+包含 BE 超周期内到达流量生成，以及 TS 周期流按 ONU 和周期进行合并的逻辑。
 合并函数保留 num_flows 与 flow_ids，用于后续按原始流数量加权统计。
 """
 
@@ -8,10 +8,15 @@ from collections import defaultdict
 
 import numpy as np
 
-from .config import MAX_MERGE_SIZE, NUM_ONU, R
+from .config import (
+    BE_RANDOM_SEED, MAX_MERGE_SIZE, NUM_ONU, R, TS_RANDOM_SEED,
+    supercycle_size,
+)
 
 
-def generate_ts_flows(flow_counts, flow_params, num_onu=NUM_ONU, seed=1):
+def generate_ts_flows(
+    flow_counts, flow_params, num_onu=NUM_ONU, seed=TS_RANDOM_SEED
+):
     """按给定数量生成四类 TS 周期流。
 
     flow_counts 的 key 为流类型名，例如 Iso_Type1、Cli_Type2；value 为该类型生成数量。
@@ -21,9 +26,11 @@ def generate_ts_flows(flow_counts, flow_params, num_onu=NUM_ONU, seed=1):
     flow_list = []
     flow_id = 0
 
+    # dict 保持配置中的插入顺序，因此 flow_id 在相同配置与种子下稳定可复现。
     for flow_type, count in flow_counts.items():
         params = flow_params[flow_type]
         for i in range(count):
+            # ONU 采用轮转分配，使每一细分类内部尽量均匀覆盖所有 ONU。
             flow_list.append({
                 "flow_id": flow_id,
                 "onu_id": i % num_onu,
@@ -41,34 +48,28 @@ def generate_ts_flows(flow_counts, flow_params, num_onu=NUM_ONU, seed=1):
     return flow_list
 
 
-def generate_be_traffic(lambda_val, num_packets, seed=1):
-    """生成 BE 流的到达时间、传输时长和 ONU 归属。
+def generate_be_traffic(lambda_val, num_packets, seed=BE_RANDOM_SEED):
+    """生成与对比算法相同的 BE 到达时间、传输时长和 ONU 归属。
 
-    到达间隔服从指数分布；包长在 64 到 1500 byte 之间随机取值，
-    再根据链路速率换算为微秒级传输时长。
+    在给定包数的条件下，到达时刻是 [0, supercycle_size) 内排序后的
+    均匀样本；包长在 64 到 1500 byte 之间，并用同一随机流生成 ONU。
+    lambda_val 仅为保持旧调用签名而保留，不再影响到达时刻。
     """
+    del lambda_val
     rng = np.random.default_rng(seed)
-    current_time = 0.0
-    arrival_times = []
-    packet_sizes = []
-
-    while len(arrival_times) < num_packets:
-        U = rng.uniform(0, 1)
-        interval = -np.log(U) / lambda_val
-        current_time += interval
-        arrival_times.append(current_time)
-
-        size_bytes = rng.integers(64, 1501)
-        size_transmit_time = size_bytes * 8 / R * 1e6
-        packet_sizes.append(size_transmit_time)
-
-    onu_ids = rng.integers(0, NUM_ONU, size=len(arrival_times))
-    return np.array(arrival_times), np.array(packet_sizes), onu_ids
+    arrival_times = np.sort(rng.uniform(
+        0.0, float(supercycle_size), size=int(num_packets)
+    ))
+    size_bytes = rng.integers(64, 1501, size=int(num_packets))
+    packet_sizes = size_bytes * 8.0 / R * 1e6
+    onu_ids = rng.integers(0, NUM_ONU, size=int(num_packets))
+    return arrival_times, packet_sizes, onu_ids
 
 
 def _make_merged(onu_id, group):
     """把同 ONU、同周期的一组循环流封装为一条聚合流。"""
     ftype = group[0].get("_orig_flow_type", group[0]["flow_type"])
+    # 聚合后的 delay/jitter 取最小值，保证不会放松组内任何原始流的约束。
     return {
         "onu_id": onu_id,
         "cycle": group[0]["cycle"],
@@ -119,6 +120,7 @@ def same_cycle_merge(flow_list):
             cycle_groups[f["cycle"]].append(f)
 
         for cycle_val in sorted(cycle_groups.keys()):
+            # 同一周期组可能仍然太大，因此按 MAX_MERGE_SIZE 依次切桶。
             bucket = []
             bucket_size = 0
             for f in cycle_groups[cycle_val]:

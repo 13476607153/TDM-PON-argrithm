@@ -1,169 +1,112 @@
-"""TS 流 ILP 调度模型。
+"""TS 整流接纳与 DBA 周期粗分配 ILP。"""
 
-该模块负责把周期流展开为超周期内的调度单元，建立时间窗、DBA 周期容量、
-抖动和负载均衡约束，并调用 docplex 求解。
-"""
+from collections import defaultdict
 
-import numpy as np
 from docplex.mp.model import Model
 
+from .config import R
+from .time_model import build_time_window, eligible_dba_periods, resource_slots
 
-def optimize_schedule(flow_list, supercycle_size, t_dba, tse=1.0, tprop=25.0, tproc=1.0, tg=1.0, time_unit=1.0):
-    """求解 TS 流的一阶段 ILP 调度。
 
-    参数 flow_list 可传入原始 TS 流，也可传入同周期合并后的聚合流。
-    返回成功调度的时间窗列表、成功调度单元数，以及按 Iso/Cli 聚合口径统计的延迟。
-    """
-    R_model = 50e9
-    LINEARIZATION_BOUND = 1e6  # 条件约束线性化使用的充分大上界。
-
-    # 将每条周期流展开为超周期内的多个调度单元。
+def _build_units(flow_list, supercycle_size, t_dba, tse, tprop, tproc):
+    """把周期流展开为超周期内的实例，并预计算资源与候选 DBA 周期。"""
     units = []
-    flow_map = {}
-    for f in flow_list:
-        N = supercycle_size // f["cycle"]
-        duration = f["size"] * 8 / R_model * 1e6
-        for n in range(int(N)):
-            at = f["start_time"] + n * f["cycle"]
-            ubd = at + f["delay"] - 2 * tse - 2 * tproc - tprop - duration
-            unit = {
-                "flow_id": f["flow_id"],
-                "onu_id": f["onu_id"],
-                "cycle": f["cycle"],
-                "n": n,
-                "arrival": at,
-                "ubd": ubd,
-                "jitter": f["jitter"],
-                "size": duration,
-                "stream_key": f["flow_id"],
-                "flow_type": f.get("flow_type", "Unknown"),
-                "num_flows": f.get("num_flows", 1),
-                "flow_ids": f.get("flow_ids", [f["flow_id"]]),
-            }
-            units.append(unit)
-            flow_map.setdefault(f["flow_id"], []).append(len(units) - 1)
+    for flow in flow_list:
+        resource = resource_slots(flow["size"], R)
+        # n（cycle_n）是该流在超周期内的实例序号。
+        for n in range(int(supercycle_size // flow["cycle"])):
+            arrival = flow["start_time"] + n * flow["cycle"]
+            window = build_time_window(arrival, flow["delay"], resource["payload_slots"],
+                                       tse, tprop, tproc)
+            periods = eligible_dba_periods(window["release_slot"], window["latest_start_slot"],
+                                           resource["occupied_slots"], supercycle_size, t_dba)
+            units.append({"unit_id": len(units), "flow_id": flow["flow_id"],
+                "onu_id": flow["onu_id"], "cycle_n": n, "n": n,
+                "arrival_time": float(arrival), "arrival": float(arrival),
+                "flow_type": flow.get("flow_type", "Unknown"),
+                "jitter": float(flow["jitter"]), "delay_limit": float(flow["delay"]),
+                "num_flows": int(flow.get("num_flows", 1)),
+                "flow_ids": flow.get("flow_ids", [flow["flow_id"]]),
+                "eligible_dba_periods": periods, **resource, **window})
+    return units
 
-    U = len(units)
-    print(f"调度单元的数量 U = {U}")
-    S = int(supercycle_size // t_dba)
 
-    # 候选开始时刻采用离散化网格，降低 ILP 变量数量。
-    candidate_step = 10.0
-    candidate_ts = []
+def optimize_schedule(flow_list, supercycle_size, t_dba, tse=1.0, tprop=25.0,
+                      tproc=1.0, tg=1.0, time_unit=1.0):
+    """返回 ILP 接纳实例；精确开始时间由全局 slot 日历决定。"""
+    del tg, time_unit
+    units = _build_units(flow_list, int(supercycle_size), int(t_dba), tse, tprop, tproc)
+    # by_flow 用于建立整流接纳约束；by_period 用于建立周期容量约束。
+    by_flow, by_period = defaultdict(list), defaultdict(list)
     for unit in units:
-        t_start = unit["arrival"] + tse
-        t_end = unit["ubd"]
-        cands = list(np.arange(t_start, t_end + 1e-6, candidate_step))
-        candidate_ts.append(cands)
+        by_flow[unit["flow_id"]].append(unit)
+        for period in unit["eligible_dba_periods"]:
+            by_period[period].append(unit)
 
-    for u, cands in enumerate(candidate_ts):
-        if not cands:
-            print(f"[WARN] 调度单元 {u} 无候选起点：arrival={units[u]['arrival']:.3f}, ubd={units[u]['ubd']:.3f}")
+    mdl = Model(name="TS_DBA_COARSE_ALLOCATION_1US")
+    # accept[f]=1 表示整条周期流被接纳；assign[u,d]=1 表示实例 u 被分配到 DBA d。
+    accept = {fid: mdl.binary_var(name=f"accept_{fid}") for fid in by_flow}
+    assign = {(u["unit_id"], d): mdl.binary_var(name=f"z_{u['unit_id']}_{d}")
+              for u in units for d in u["eligible_dba_periods"]}
 
-    # x 表示调度单元是否成功，s 表示开始时间，y 表示选中的离散候选起点。
-    mdl = Model(name="TA-DetBA_ILP_OBJ2_FIXED_WEIGHTED_STATS")
-    x = mdl.binary_var_list(U, name="x")
-    s = mdl.continuous_var_list(U, name="s")
-    y = [
-        [mdl.binary_var(name=f"y_{u}_{k}") for k in range(len(candidate_ts[u]))]
-        for u in range(U)
-    ]
-    dmax = mdl.continuous_var(name="Dmax")
+    # 同一流的每个实例都必须等于同一个 accept 值，禁止只接纳部分周期实例。
+    for fid, flow_units in by_flow.items():
+        if any(not unit["eligible_dba_periods"] for unit in flow_units):
+            mdl.add_constraint(accept[fid] == 0)
+        for unit in flow_units:
+            mdl.add_constraint(mdl.sum(assign[unit["unit_id"], d]
+                                       for d in unit["eligible_dba_periods"]) == accept[fid])
 
-    for u, unit in enumerate(units):
-        arrival, ubd, dur = unit["arrival"], unit["ubd"], unit["size"]
-        if len(candidate_ts[u]) == 0:
-            mdl.add_constraint(x[u] == 0)
-            continue
-        mdl.add_constraint(mdl.sum(y[u]) == x[u])
-        mdl.add_constraint(s[u] == mdl.sum(candidate_ts[u][k] * y[u][k] for k in range(len(candidate_ts[u]))))
-        mdl.add_constraint(s[u] >= (arrival + tse) * x[u])
-        mdl.add_constraint(s[u] + dur <= ubd + (1 - x[u]) * LINEARIZATION_BOUND)
-        mdl.add_constraint(s[u] >= 0)
-        mdl.add_constraint(s[u] + dur <= supercycle_size)
+    period_load = {}
+    for period in range(int(supercycle_size // t_dba)):
+        period_units = by_period.get(period, [])
+        period_load[period] = mdl.sum(unit["occupied_slots"] * assign[unit["unit_id"], period]
+                                      for unit in period_units)
+        mdl.add_constraint(period_load[period] <= t_dba)
 
-    z = [[mdl.binary_var(name=f"z_{u}_{s_idx}") for s_idx in range(S)] for u in range(U)]
-    for u in range(U):
-        for s_idx in range(S):
-            t_start = s_idx * t_dba
-            t_end = (s_idx + 1) * t_dba - 1e-6
-            b1 = mdl.binary_var(name=f"b1_{u}_{s_idx}")
-            b2 = mdl.binary_var(name=f"b2_{u}_{s_idx}")
-            mdl.add_constraint(s[u] >= t_start - (1 - b1) * LINEARIZATION_BOUND)
-            mdl.add_constraint(s[u] <= t_end + (1 - b2) * LINEARIZATION_BOUND)
-            mdl.add_constraint(z[u][s_idx] <= b1)
-            mdl.add_constraint(z[u][s_idx] <= b2)
-            mdl.add_constraint(z[u][s_idx] >= b1 + b2 - 1)
-            mdl.add_constraint(z[u][s_idx] <= x[u])
+        # 仅有 DBA 总容量仍可能出现大量窄时间窗集中在周期前部的情况。
+        # 因此增加截止点前缀必要条件：必须在 deadline 前完成的总工作量，
+        # 不得超过从 DBA 起点到该 deadline 的可用长度。
+        deadlines = sorted({min(unit["service_deadline_slot"], (period + 1) * t_dba)
+                            for unit in period_units})
+        period_start = period * t_dba
+        for deadline in deadlines:
+            forced = [unit for unit in period_units
+                      if min(unit["service_deadline_slot"], (period + 1) * t_dba) <= deadline]
+            mdl.add_constraint(mdl.sum(unit["occupied_slots"] * assign[unit["unit_id"], period]
+                                       for unit in forced) <= max(0, deadline - period_start))
 
-    for s_idx in range(S):
-        mdl.add_constraint(
-            mdl.sum(z[u][s_idx] * units[u]["size"] for u in range(U)) <= t_dba
-        )
+    # dmax 表示任意两个 DBA 周期之间的最大负载差，用作次级均衡目标。
+    dmax = mdl.continuous_var(lb=0, name="dmax")
+    periods = list(period_load)
+    for left in periods:
+        for right in periods[left + 1:]:
+            mdl.add_constraint(dmax >= period_load[left] - period_load[right])
+            mdl.add_constraint(dmax >= period_load[right] - period_load[left])
 
-    delta_max = {}
-    delta_min = {}
-    for fid, idxs in flow_map.items():
-        jitter_i = units[idxs[0]]["jitter"]
-        delta_max[fid] = mdl.continuous_var(name=f"delta_max_{fid}")
-        delta_min[fid] = mdl.continuous_var(name=f"delta_min_{fid}")
-        for u in idxs:
-            arrival = units[u]["arrival"]
-            delay = s[u] - arrival
-            mdl.add_constraint(delta_max[fid] >= delay - (1 - x[u]) * LINEARIZATION_BOUND)
-            mdl.add_constraint(delta_min[fid] <= delay + (1 - x[u]) * LINEARIZATION_BOUND)
-        mdl.add_constraint(delta_max[fid] - delta_min[fid] <= jitter_i)
+    total_weight = sum(int(flow_units[0].get("num_flows", 1)) for flow_units in by_flow.values())
+    # 主目标按 num_flows 最大化接纳的原始流数量；足够大的主目标权重确保
+    # 负载均衡项不会以少接纳业务为代价获得更优目标值。
+    mdl.maximize((int(supercycle_size) + 1) * mdl.sum(
+        int(flow_units[0].get("num_flows", 1)) * accept[fid]
+        for fid, flow_units in by_flow.items()) - dmax / max(1, total_weight))
 
-    for s1 in range(S):
-        for s2 in range(s1 + 1, S):
-            load1 = mdl.sum(z[u][s1] for u in range(U))
-            load2 = mdl.sum(z[u][s2] for u in range(U))
-            mdl.add_constraint(dmax >= load1 - load2)
-            mdl.add_constraint(dmax >= load2 - load1)
-
-    S_us = mdl.binary_var_list(len(flow_map), name="S_us")
-    fid_to_pos = {fid: i for i, fid in enumerate(flow_map.keys())}
-    for fid, idxs in flow_map.items():
-        pos = fid_to_pos[fid]
-        for u in idxs:
-            mdl.add_constraint(S_us[pos] >= 1 - x[u])
-
-    alpha = 1.0 / max(1, len(flow_map))
-    beta = 1.0 / supercycle_size
-    mdl.minimize(alpha * mdl.sum(S_us) + beta * dmax)
-
-    sol = mdl.solve(log_output=False)
-    if not sol:
-        print("[ERROR] 未找到可行解")
+    solution = mdl.solve(log_output=False)
+    if not solution:
+        print("[ERROR] 未找到可行的 TS DBA 粗分配解")
         return None, 0, {}
 
-    print("[OK] 调度成功")
     result = []
-    count = 0
-    for u, unit in enumerate(units):
-        if sol.get_value(x[u]) > 0.5:
-            start = sol.get_value(s[u])
-            result.append({
-                "flow_id": unit["flow_id"],
-                "onu_id": unit["onu_id"],
-                "n": unit["n"],
-                "start": start,
-                "size": unit["size"],
-                "flow_type": unit["flow_type"],
-                "arrival": unit["arrival"],
-                "num_flows": unit.get("num_flows", 1),
-                "flow_ids": unit.get("flow_ids", [unit["flow_id"]]),
-            })
-            count += 1
-    print(f"成功调度 {count}/{U} 个调度单元")
+    rejected = 0
+    for fid, flow_units in by_flow.items():
+        if solution.get_value(accept[fid]) <= 0.5:
+            rejected += 1
+            continue
+        for unit in flow_units:
+            period = next(d for d in unit["eligible_dba_periods"]
+                          if solution.get_value(assign[unit["unit_id"], d]) > 0.5)
+            result.append({**unit, "dba_period": period, "size": unit["raw_tx_time_us"]})
 
-    delay_dict = {"Iso": [], "Cli": []}
-    for item in result:
-        delay = item["start"] - item["arrival"]
-        ftype = item.get("flow_type", "Unknown")
-        if "Iso" in ftype or "isochronous" in ftype:
-            delay_dict["Iso"].append(delay)
-        elif "Cli" in ftype or "cyclic" in ftype:
-            delay_dict["Cli"].append(delay)
-
-    return result, count, delay_dict
+    print(f"[OK] ILP 接纳 {len(by_flow) - rejected}/{len(by_flow)} 条 TS 流，"
+          f"分配 {len(result)}/{len(units)} 个实例")
+    return result, len(result), {"Iso": [], "Cli": []}

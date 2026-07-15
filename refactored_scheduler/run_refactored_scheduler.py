@@ -1,6 +1,9 @@
 """PyCharm/command-line entry point for the refactored TS-DetBA scheduler."""
 
-from refactored_scheduler.main import main
+try:
+    from .main import main
+except ImportError:  # 兼容在项目父目录已加入 sys.path 时直接运行本文件。
+    from refactored_scheduler.main import main
 
 
 def run_refactored_scheduler():

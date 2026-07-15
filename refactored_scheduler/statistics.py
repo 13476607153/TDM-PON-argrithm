@@ -14,6 +14,7 @@ def calculate_jitter_statistics(refined_df):
         return {"Iso": [], "Cli": []}, {}
 
     flow_jitter = []
+    # 抖动必须在同一周期流的多个实例之间计算，不能跨 flow_id 混合。
     for flow_id in refined_df["flow_id"].unique():
         flow_packets = refined_df[refined_df["flow_id"] == flow_id]
         if len(flow_packets) <= 1:
@@ -58,6 +59,7 @@ def calculate_jitter_statistics(refined_df):
 
 def _get_weights(df):
     """读取 num_flows 作为统计权重；缺失时按 1 条原始流处理。"""
+    # 最终中文结果表使用“聚合原始流数量”；缺少该列表示每行权重默认为 1。
     if "聚合原始流数量" in df.columns:
         return pd.to_numeric(df["聚合原始流数量"], errors="coerce").fillna(1).astype(int)
     return pd.Series(np.ones(len(df), dtype=int), index=df.index)
@@ -66,6 +68,7 @@ def _get_weights(df):
 def _weighted_mean(values, weights):
     """计算加权平均值；空输入或零权重时返回 NaN。"""
     values = pd.to_numeric(values, errors="coerce")
+    # 失败记录通常没有数值延迟，先过滤 NaN，同时保持权重索引对齐。
     mask = values.notna()
     if mask.sum() == 0:
         return float("nan")
@@ -113,17 +116,28 @@ def build_flow_type_success_stats(final_schedule_df, expected_counts=None):
     rows = []
 
     for flow_type, group in final_schedule_df.groupby("流类型", dropna=False):
-        weights = _get_weights(group)
+        # 周期流在结果表中包含多个 cycle_n；成功/失败数量必须按唯一流计数，
+        # 不能把每个周期实例重复乘以 num_flows。
+        # TS 一条流会有多个周期实例，因此先折叠到流级；任一实例失败，
+        # 该流整体即按失败处理。BE 每个 flow_id 只有一个包。
+        flow_level = group.sort_values("流ID").groupby("流ID", as_index=False).agg({
+            "聚合原始流数量": "first",
+            "调度状态": lambda values: "成功" if (values == "成功").all() else "失败",
+        })
+        weights = _get_weights(flow_level)
         success_group = group[group["调度状态"] == "成功"]
-        success_weights = _get_weights(success_group) if not success_group.empty else pd.Series(dtype=int)
-        failed_group = group[group["调度状态"] == "失败"]
-        failed_weights = _get_weights(failed_group) if not failed_group.empty else pd.Series(dtype=int)
+        success_flows = flow_level[flow_level["调度状态"] == "成功"]
+        failed_flows = flow_level[flow_level["调度状态"] == "失败"]
+        success_weights = _get_weights(success_flows) if not success_flows.empty else pd.Series(dtype=int)
+        failed_weights = _get_weights(failed_flows) if not failed_flows.empty else pd.Series(dtype=int)
 
+        # 提供生成数量时以参数快照为分母，使未进入结果表的业务也计入失败。
         expected = expected_counts.get(flow_type)
         observed_total = int(weights.sum()) if not group.empty else 0
         denominator = expected if expected is not None else observed_total
-        success_total = int(success_weights.sum()) if not success_group.empty else 0
-        failed_total = int(failed_weights.sum()) if not failed_group.empty else 0
+        success_total = int(success_weights.sum()) if not success_flows.empty else 0
+        failed_observed = int(failed_weights.sum()) if not failed_flows.empty else 0
+        failed_total = max(0, int(denominator) - success_total) if expected is not None else failed_observed
         success_rate = success_total / denominator * 100 if denominator else 0.0
 
         delays = pd.to_numeric(success_group["延迟(us)"], errors="coerce") if not success_group.empty else pd.Series(dtype=float)
@@ -183,6 +197,7 @@ def compute_statistics(final_schedule_df, supercycle_size, flow_params=None):
         max_delay = delays.max() if not delays.empty else float("nan")
         avg_delay = _weighted_mean(delays, _get_weights(succ_subset)) if not succ_subset.empty else float("nan")
 
+        # 资源占用按实际实例求和，不乘聚合权重；聚合只影响业务数量口径。
         tx_success_ftype = pd.to_numeric(succ_subset["传输时长"], errors="coerce").sum() if not succ_subset.empty else 0.0
         tx_allocated_ftype = pd.to_numeric(subset["传输时长"], errors="coerce").sum() if not subset.empty else 0.0
         rue_ftype = tx_success_ftype / tx_allocated_ftype * 100 if tx_allocated_ftype > 0 else 0.0
@@ -252,7 +267,11 @@ def compute_statistics(final_schedule_df, supercycle_size, flow_params=None):
 
     succ_mask = final_schedule_df["调度状态"] == "成功"
     total_tx_time = pd.to_numeric(final_schedule_df[succ_mask]["传输时长"], errors="coerce").sum()
-    resource_util = total_tx_time / supercycle_size * 100
+    payload_time = pd.to_numeric(final_schedule_df[succ_mask].get("包发送占用(us)", 0), errors="coerce").sum()
+    guard_time = pd.to_numeric(final_schedule_df[succ_mask].get("隔离带占用(us)", 0), errors="coerce").sum()
+    occupied_time = pd.to_numeric(final_schedule_df[succ_mask].get("资源占用(us)", 0), errors="coerce").sum()
+    raw_time = pd.to_numeric(final_schedule_df[succ_mask].get("原始传输时长(us)", 0), errors="coerce").sum()
+    resource_util = occupied_time / supercycle_size * 100
 
     ts_mask = final_schedule_df["流类型"].str.contains("Iso|Cli", na=False)
     ts_success_tx = pd.to_numeric(final_schedule_df[ts_mask & succ_mask]["传输时长"], errors="coerce").sum()
@@ -263,6 +282,13 @@ def compute_statistics(final_schedule_df, supercycle_size, flow_params=None):
         "总传输时长(us)": round(total_tx_time, 6),
         "超周期大小(us)": supercycle_size,
         "资源利用率(%)": round(resource_util, 2),
+        "Payload占用时长(us)": round(payload_time, 6),
+        "隔离带占用时长(us)": round(guard_time, 6),
+        "总资源占用时长(us)": round(occupied_time, 6),
+        "Payload利用率(%)": round(payload_time / supercycle_size * 100, 2),
+        "链路占用率(%)": round(resource_util, 2),
+        "Guard开销率(%)": round(guard_time / occupied_time * 100, 2) if occupied_time else 0.0,
+        "物理有效载荷率(%)": round(raw_time / supercycle_size * 100, 2),
         "TS流成功传输时长(us)": round(ts_success_tx, 6),
         "TS流分配总带宽(us)": round(ts_allocated_tx, 6),
         "资源利用效率RUE(%)": round(rue_total, 2),
